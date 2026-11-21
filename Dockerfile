@@ -2,7 +2,8 @@ FROM python:3.11-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    DEBIAN_FRONTEND=noninteractive
+    DEBIAN_FRONTEND=noninteractive \
+    DATA_DIR=/data
 
 # Системные зависимости для OpenCV, pyzbar, Tesseract OCR, FFmpeg и Playwright
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -24,6 +25,6 @@ RUN playwright install --with-deps chromium
 # Директория для постоянного хранения SQLite базы и сессий
 RUN mkdir -p /data
 
-COPY bot.py .
+COPY main.py .
 
-CMD ["python", "bot.py"]
+CMD ["python", "main.py"]
