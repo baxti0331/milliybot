@@ -15,7 +15,12 @@ import cv2
 import numpy as np
 import pytesseract
 from curl_cffi.requests import AsyncSession
-from pyzbar.pyzbar import ZBarSymbol, decode as decode_qr
+try:
+    from pyzbar.pyzbar import ZBarSymbol, decode as decode_qr
+except (ImportError, OSError):
+    # zbar tizim kutubxonasi yo'q bo'lsa, QR o'qish OpenCV orqali davom etadi
+    ZBarSymbol = None
+    decode_qr = None
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
@@ -104,7 +109,9 @@ BLOCKED_URL_MARKERS = (
     "facebook.net",
 )
 
-DATA_DIR = "/data" if os.path.isdir("/data") else "./data"
+DATA_DIR = os.getenv("DATA_DIR", "").strip() or (
+    "/data" if os.path.isdir("/data") else "./data"
+)
 os.makedirs(DATA_DIR, exist_ok=True)
 
 DB_PATH = os.path.join(DATA_DIR, "milliydaman_pro.db")
@@ -940,7 +947,7 @@ def decode_qr_from_frame(frame: np.ndarray) -> str | None:
                     interpolation=cv2.INTER_CUBIC,
                 )
             )
-            for candidate in _qr_candidates(image):
+            for candidate in _qr_candidates(image) if decode_qr else ():
                 try:
                     objects = decode_qr(candidate, symbols=[ZBarSymbol.QRCODE])
                     for obj in objects:
