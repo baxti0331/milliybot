@@ -66,7 +66,6 @@ ADMIN_IDS = [
 ENV_SOURCE_URL = os.getenv("SOURCE_URL", "").strip()
 ENV_COOKIES = os.getenv("ITV_COOKIES", "").strip()
 ENV_BEARER_TOKEN = os.getenv("ITV_BEARER_TOKEN", "").strip()
-ENV_PROXY_URL = os.getenv("PROXY_URL", "").strip()
 
 DEFAULT_FRAME_INTERVAL = float(os.getenv("FRAME_INTERVAL", "2"))
 
@@ -216,7 +215,6 @@ async def init_db():
             ("source_url", ENV_SOURCE_URL),
             ("cookies", ENV_COOKIES),
             ("bearer_token", ENV_BEARER_TOKEN),
-            ("proxy_url", ENV_PROXY_URL),
             ("frame_interval", str(DEFAULT_FRAME_INTERVAL)),
         )
 
@@ -239,7 +237,6 @@ async def get_setting(key: str) -> str:
         "source_url": ENV_SOURCE_URL,
         "cookies": ENV_COOKIES,
         "bearer_token": ENV_BEARER_TOKEN,
-        "proxy_url": ENV_PROXY_URL,
         "frame_interval": str(DEFAULT_FRAME_INTERVAL),
     }
 
@@ -484,52 +481,6 @@ def parse_itv_cookies(raw: str) -> tuple[dict[str, str], str]:
 
 
 # ============================================================
-# PROXY
-# ============================================================
-
-def normalize_proxy(proxy_url: str) -> str:
-    proxy_url = (proxy_url or "").strip()
-    if not proxy_url:
-        return ""
-
-    if proxy_url.startswith("tcp://"):
-        proxy_url = "http://" + proxy_url[6:]
-
-    parsed = urlparse(proxy_url)
-    if parsed.scheme.lower() not in ("http", "https", "socks5", "socks5h"):
-        raise ValueError(
-            "Поддерживаются HTTP, HTTPS или SOCKS5 прокси (например, http://host:port)."
-        )
-
-    if not parsed.hostname:
-        raise ValueError("Некорректный адрес Proxy.")
-
-    if parsed.port is not None and not (1 <= parsed.port <= 65535):
-        raise ValueError("Некорректный порт Proxy.")
-
-    return proxy_url
-
-
-def playwright_proxy(proxy_url: str) -> dict | None:
-    if not proxy_url:
-        return None
-
-    parsed = urlparse(proxy_url)
-    if not parsed.hostname:
-        return {"server": proxy_url}
-
-    server = (
-        f"{parsed.scheme or 'http'}://{parsed.hostname}"
-        + (f":{parsed.port}" if parsed.port else "")
-    )
-    config: dict[str, str] = {"server": server}
-    if parsed.username:
-        config["username"] = parsed.username
-        config["password"] = parsed.password or ""
-    return config
-
-
-# ============================================================
 # M3U8 EXTRACTION
 # ============================================================
 
@@ -566,8 +517,6 @@ async def resolve_fresh_m3u8_url() -> str | None:
 
     cookies, auto_token = parse_itv_cookies(await get_setting("cookies"))
     bearer = (await get_setting("bearer_token")).strip() or auto_token
-    proxy_url = normalize_proxy(await get_setting("proxy_url"))
-
     headers = {
         "User-Agent": UA,
         "Accept": "application/json, text/plain, text/html, */*",
@@ -579,12 +528,9 @@ async def resolve_fresh_m3u8_url() -> str | None:
             bearer if bearer.lower().startswith("bearer ") else f"Bearer {bearer}"
         )
 
-    proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
-
     try:
         async with AsyncSession(
             impersonate="chrome124",
-            proxies=proxies,
             verify=False,
             timeout=20,
         ) as session:
@@ -678,7 +624,6 @@ async def browser_open_player(
         return None, None, "Playwright не установлен"
 
     cookies, _ = parse_itv_cookies(await get_setting("cookies"))
-    proxy_url = normalize_proxy(await get_setting("proxy_url"))
 
     pw_cookies = [
         {
@@ -748,10 +693,6 @@ async def browser_open_player(
                     "--mute-audio",
                 ],
             }
-            pw_proxy = playwright_proxy(proxy_url)
-            if pw_proxy:
-                launch["proxy"] = pw_proxy
-
             browser = await p.chromium.launch(**launch)
 
             try:
@@ -1122,13 +1063,11 @@ def _build_ffmpeg_headers(m3u8_url: str, cookie_header: str) -> str:
 
 def open_capture(
     m3u8_url: str,
-    proxy_url: str,
     cookie_header: str,
 ) -> cv2.VideoCapture:
     if not m3u8_url.lower().startswith(("http://", "https://")):
         raise ValueError("Некорректный M3U8 URL.")
 
-    proxy_url = normalize_proxy(proxy_url)
     headers = _build_ffmpeg_headers(m3u8_url, cookie_header)
 
     options = [
@@ -1140,8 +1079,6 @@ def open_capture(
         "reconnect_delay_max;4",
         f"headers;{headers}",
     ]
-    if proxy_url and proxy_url.startswith(("http://", "https://")):
-        options.append(f"http_proxy;{proxy_url}")
 
     params = [
         cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,
@@ -1174,20 +1111,16 @@ def open_capture(
 
 def grab_single_frame_ffmpeg_cli(
     m3u8_url: str,
-    proxy_url: str,
     cookie_header: str,
     insecure: bool = False,
     timeout: int = 75,
 ) -> tuple[np.ndarray | None, str]:
     """Один кадр через системный ffmpeg. Возвращает (кадр, текст ошибки)."""
-    proxy_url = normalize_proxy(proxy_url)
     headers = _build_ffmpeg_headers(m3u8_url, cookie_header)
 
     cmd = ["ffmpeg", "-nostdin", "-y", "-hide_banner", "-loglevel", "error"]
     if insecure:
         cmd += ["-tls_verify", "0"]
-    if proxy_url and proxy_url.startswith(("http://", "https://")):
-        cmd += ["-http_proxy", proxy_url]
     cmd += [
         "-headers",
         headers,
@@ -1230,16 +1163,15 @@ def grab_single_frame_ffmpeg_cli(
 
 def grab_single_frame(
     m3u8_url: str,
-    proxy_url: str,
     cookie_header: str,
 ) -> np.ndarray | None:
-    # Через прокси старт HLS занимает до ~50 с, поэтому таймаут большой.
-    frame, err = grab_single_frame_ffmpeg_cli(m3u8_url, proxy_url, cookie_header)
+    # Старт HLS может занимать до ~50 с, поэтому таймаут большой.
+    frame, err = grab_single_frame_ffmpeg_cli(m3u8_url, cookie_header)
 
     if frame is None and re.search(r"certificate|ssl|tls", err, re.IGNORECASE):
         logger.warning("Скриншот: ошибка TLS, повторяю с -tls_verify 0.")
         frame, err = grab_single_frame_ffmpeg_cli(
-            m3u8_url, proxy_url, cookie_header, insecure=True
+            m3u8_url, cookie_header, insecure=True
         )
 
     if frame is None:
@@ -1249,20 +1181,16 @@ def grab_single_frame(
 
 def _ffmpeg_stream_cmd(
     m3u8_url: str,
-    proxy_url: str,
     cookie_header: str,
     interval: float,
     insecure: bool = False,
 ) -> list[str]:
     """ffmpeg отдаёт в stdout один MJPEG-кадр раз в `interval` секунд."""
-    proxy_url = normalize_proxy(proxy_url)
     headers = _build_ffmpeg_headers(m3u8_url, cookie_header)
 
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
     if insecure:
         cmd += ["-tls_verify", "0"]
-    if proxy_url and proxy_url.startswith(("http://", "https://")):
-        cmd += ["-http_proxy", proxy_url]
     cmd += [
         "-headers",
         headers,
@@ -1289,7 +1217,6 @@ def _ffmpeg_stream_cmd(
 
 def _run_ffmpeg_stream(
     m3u8_url: str,
-    proxy_url: str,
     cookie_header: str,
     loop: asyncio.AbstractEventLoop,
     insecure: bool,
@@ -1298,7 +1225,7 @@ def _run_ffmpeg_stream(
     from collections import deque
 
     interval = max(0.5, float(frame_interval))
-    cmd = _ffmpeg_stream_cmd(m3u8_url, proxy_url, cookie_header, interval, insecure)
+    cmd = _ffmpeg_stream_cmd(m3u8_url, cookie_header, interval, insecure)
 
     proc = subprocess.Popen(
         cmd,
@@ -1423,13 +1350,12 @@ def _run_ffmpeg_stream(
 
 def scan_stream_blocking(
     m3u8_url: str,
-    proxy_url: str,
     cookie_header: str,
     loop: asyncio.AbstractEventLoop,
 ) -> str:
     try:
         reason, frames, err = _run_ffmpeg_stream(
-            m3u8_url, proxy_url, cookie_header, loop, insecure=False
+            m3u8_url, cookie_header, loop, insecure=False
         )
 
         # Если упёрлись в сертификат и кадров не было — повторяем без проверки TLS.
@@ -1440,7 +1366,7 @@ def scan_stream_blocking(
         ):
             logger.warning("Ошибка TLS в ffmpeg, повторяю с -tls_verify 0.")
             reason, frames, err = _run_ffmpeg_stream(
-                m3u8_url, proxy_url, cookie_header, loop, insecure=True
+                m3u8_url, cookie_header, loop, insecure=True
             )
 
         if not reason.startswith(("остановлено", "интервал")):
@@ -1728,13 +1654,12 @@ async def stream_scanner_worker():
                 last_warn = time.monotonic()
                 await notify_admins(
                     "⚠️ Не удалось получить ссылку <code>.m3u8</code>.\n"
-                    "Проверьте URL, Cookies, Bearer Token и Proxy.\n"
+                    "Проверьте URL, Cookies и Bearer Token.\n"
                     "Повторяю попытку через 20 секунд."
                 )
             await asyncio.sleep(20)
             continue
 
-        proxy_url = await get_setting("proxy_url")
         cookies, _ = parse_itv_cookies(await get_setting("cookies"))
         cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
@@ -1746,7 +1671,6 @@ async def stream_scanner_worker():
         reason = await asyncio.to_thread(
             scan_stream_blocking,
             cached_m3u8,
-            proxy_url,
             cookie_header,
             loop,
         )
@@ -1779,7 +1703,6 @@ class AdminStates(StatesGroup):
     waiting_source_url = State()
     waiting_cookies = State()
     waiting_token = State()
-    waiting_proxy_url = State()
 
     waiting_custom_interval = State()
 
@@ -1847,10 +1770,6 @@ def admin_main_kb(
                 InlineKeyboardButton(
                     text="🔗 URL канала / API",
                     callback_data="set_source_url",
-                ),
-                InlineKeyboardButton(
-                    text="🌐 UZ Proxy URL",
-                    callback_data="set_proxy_url",
                 ),
             ],
             [
@@ -1967,7 +1886,6 @@ async def render_admin_panel(target: Message | CallbackQuery):
         f"🧮 <b>Кадров проанализировано:</b> {frames_text}\n"
         f"⏱ <b>Частота анализа:</b> каждые <b>{interval:g} с</b>\n"
         f"👥 <b>Юзерботов:</b> {active_count} из {len(accounts)}\n"
-        f"🌐 <b>Proxy:</b> <code>{short(await get_setting('proxy_url'))}</code>\n"
         f"🔗 <b>Источник:</b> <code>{short(await get_setting('source_url'))}</code>\n"
         f"🍪 <b>Cookies:</b> {f'✅ ({len(cookies)} шт.)' if cookies else '❌'} | "
         f"🔑 <b>Token:</b> {'✅' if await get_setting('bearer_token') else '➖'}\n\n"
@@ -2059,12 +1977,6 @@ async def cb_toggle_scan(callback: CallbackQuery):
             )
             return
 
-        try:
-            normalize_proxy(await get_setting("proxy_url"))
-        except ValueError as e:
-            await callback.answer(str(e), show_alert=True)
-            return
-
         scanner_stop.clear()
         scanner_running = True
         cached_m3u8 = None
@@ -2099,41 +2011,6 @@ async def cb_last_frame(callback: CallbackQuery):
         caption=f"🖼 Последний кадр, который анализировал сканер ({age} с назад)",
     )
     await callback.answer()
-
-
-# ============================================================
-# PROXY
-# ============================================================
-
-@router.callback_query(F.data == "set_proxy_url")
-async def cb_set_proxy_url(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_proxy_url)
-    await callback.message.answer(
-        f"🌐 Текущий прокси: <code>{await get_setting('proxy_url') or 'Не задан'}</code>\n\n"
-        "Отправьте новый адрес (<code>http://host:port</code>) или <code>-</code> чтобы очистить:"
-    )
-    await callback.answer()
-
-
-@router.message(AdminStates.waiting_proxy_url, F.text)
-async def process_proxy_url(message: Message, state: FSMContext):
-    global cached_m3u8
-    value = message.text.strip()
-
-    if value == "-":
-        value = ""
-    else:
-        try:
-            value = normalize_proxy(value)
-        except ValueError as e:
-            await message.answer(f"❌ {e}")
-            return
-
-    await set_setting("proxy_url", value)
-    cached_m3u8 = None
-    await state.clear()
-    await message.answer("✅ Прокси сохранён. При следующем подключении будут применены новые настройки.")
-    await render_admin_panel(message)
 
 
 # ============================================================
@@ -2198,9 +2075,8 @@ async def cb_take_screenshot(callback: CallbackQuery):
         return
 
     await callback.answer("Работаю...")
-    status = await callback.message.answer("⏳ <b>Получаю кадр с ITV.uz...</b>\nЧерез прокси это может занять до 1–2 минут.")
+    status = await callback.message.answer("⏳ <b>Получаю кадр с ITV.uz...</b>\nЭто может занять до 1–2 минут.")
 
-    proxy_url = await get_setting("proxy_url")
     cookies, _ = parse_itv_cookies(await get_setting("cookies"))
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items())
 
@@ -2235,7 +2111,6 @@ async def cb_take_screenshot(callback: CallbackQuery):
         frame = await asyncio.to_thread(
             grab_single_frame,
             m3u8,
-            proxy_url,
             cookie_header,
         )
         if frame is not None:
@@ -2255,8 +2130,7 @@ async def cb_take_screenshot(callback: CallbackQuery):
             "Проверьте:\n"
             "• URL источника (или прямую ссылку <code>.m3u8</code>);\n"
             "• Cookies;\n"
-            "• Bearer Token;\n"
-            "• Proxy (включая доступ к TAS-IX / itv.uz)."
+            "• Bearer Token."
         )
         return
 
